@@ -1,0 +1,1 @@
+There are two parts of our code that we used in this project. One of the codes is for our Arduino module which controls the weight and color sensors. The othe is the pi pico which oversees the RFID, transceivers, and uses the data incoming from the Arduino to make a scoring decision which is output to a LED scoreboard. 
