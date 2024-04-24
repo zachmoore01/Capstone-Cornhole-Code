@@ -1,0 +1,279 @@
+
+/*
+   -------------------------------------------------------------------------------------
+   HX711_ADC
+   Arduino library for HX711 24-Bit Analog-to-Digital Converter for Weight Scales
+   Olav Kallhovd sept2017
+   -------------------------------------------------------------------------------------
+*/
+
+/*
+   This example file shows how to calibrate the load cell and optionally store the calibration
+   value in EEPROM, and also how to change the value manually.
+   The result value can then later be included in your project sketch or fetched from EEPROM.
+
+   To implement calibration in your project sketch the simplified procedure is as follow:
+       LoadCell.tare();
+       //place known mass
+       LoadCell.refreshDataSet();
+       float newCalibrationValue = LoadCell.getNewCalibration(known_mass);
+*/
+
+#include <HX711_ADC.h>
+// #include <StackArray.h>
+#if defined(ESP8266)|| defined(ESP32) || defined(AVR)
+#include <EEPROM.h>
+#endif
+// debug macro
+// #define(BORD1)
+#if defined(BORD1)
+#define CAL -35.10
+#else
+#define BORD2
+#define CAL 37.45
+#endif
+
+//#define BB_DEBUG
+#define STRINGIZE(x) STRINGIZE2(x)
+#define STRINGIZE2(x) #x
+#define LINE_STRING STRINGIZE(__LINE__)
+#if defined(BB_DEBUG)
+#define ERROR(s) Serial.write("ER_" #s ": " STRINGIZE(__LINE__))
+#else
+#define ERROR(s) Serial.write("ER_" #s "\n")
+#endif
+
+enum color {BLACK=0, RED=1, BLUE=2, NOSENSE=3};
+
+#define COLOR(c) colornames[c]
+#define GT(a,b,t) ((a-b)>t)
+
+
+class Light {
+public:
+  void setup() {
+    delay(10);
+    pinMode(s0,OUTPUT);    //pin modes
+    pinMode(s1,OUTPUT);
+    pinMode(s2,OUTPUT);
+    pinMode(s3,OUTPUT);
+    pinMode(out,INPUT);
+    digitalWrite(s0,HIGH);  //Putting S0/S1 on HIGH/HIGH levels means the output frequency scalling is at 100%  (recommended)
+    digitalWrite(s1,HIGH); //LOW/LOW is off HIGH/LOW is 20% and  LOW/HIGH is  2%
+    ColorCorrection();
+    r=g=b=0;
+    state = BLACK;
+    t = millis();
+  }
+  void ColorCorrection() {
+    rr=gg=bb=0;
+    // Serial.print("Correcting color... ");
+    unsigned long t1 = millis();
+    for (int i=0; i<100; ++i) {
+      // Serial.print(".");
+      setColor();
+      rr+=r;
+      gg+=g;
+      bb+=b;
+      delay(20);
+    }
+    if (millis() > t1 + 5000) {
+      ERROR("TIMEOUT");
+      while (1);
+    }
+    rr/=100;
+    gg/=100;
+    bb/=100;
+    if (rr < 200 || gg < 400 || bb < 400) {
+      ERROR("LS");
+      while (1);
+    }
+#if defined(BB_DEBUG)
+    Serial.println("CCR ");
+    Serial.print(rr);
+    Serial.print(" ");
+    Serial.print(gg);
+    Serial.print(" ");
+    Serial.print(bb);
+    Serial.println();
+#endif
+  }
+  
+  color getColor(bool &test) {
+    if (millis() < t + interval) return;
+    float r1,g1,b1;
+    GetCorrectedRGB(r1,g1,b1);
+    color ns;
+    if ((r1 < 0.5) || (b1 < 0.5)) {
+      if (abs(r1 - b1) < 0.01) ns = NOSENSE;
+      else if (r1 > b1) ns = BLUE;
+      else ns = RED;
+    } else ns = BLACK;
+
+    if (ns != state) {
+      state = ns;
+      test = true;
+      /*
+      Serial.print(" R: ");
+      Serial.print(r1);
+      Serial.print(" G: ");
+      Serial.print(g1);
+      Serial.print(" B: ");
+      Serial.print(b1);
+      Serial.println();
+      */
+    }
+    t = millis();
+    return state;
+  }
+
+private:
+  const int s0 = 8;       //Module pins wiring
+  const int s1 = 9;
+  const int s2 = 10;
+  const int s3 = 11;
+  const int out = 12;
+  const int interval = 20; // check every 0.02 secs
+  //char* colornames[4] = {"BLACK", "RED", "BLUE", "N/A"};
+  unsigned long r,g,b; //This is where we're going to stock our values
+  unsigned long rr,gg,bb;
+  unsigned long t; // timer
+  color state;
+  void setColor() {
+    digitalWrite(s2,LOW);
+    digitalWrite(s3,LOW);
+    r=pulseIn(out,LOW);
+
+    digitalWrite(s2,LOW);
+    digitalWrite(s3,HIGH);
+    b=pulseIn(out,LOW);
+
+    digitalWrite(s2,HIGH);
+    digitalWrite(s3,HIGH);
+
+    g=pulseIn(out,LOW);
+  }
+  void GetCorrectedRGB(float &xr, float &xg, float &xb) {
+    setColor();
+    xr=(float)r/(float)rr;
+    xg=(float)g/(float)gg;
+    xb=(float)b/(float)bb;
+    delay(10);
+  }
+};
+
+Light light;
+
+//pins:
+const int HX711_dout = 4; //mcu > HX711 dout pin
+const int HX711_sck = 5; //mcu > HX711 sck pin
+
+//HX711 constructor:
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+
+unsigned long t = 0;
+
+float stack[32];
+int stack_ptr;
+#define PUSH(s,x) s[s##_ptr++] = x
+#define POP(s) s[--s##_ptr]
+#define PEEK(s) ((s##_ptr>0)?s[s##_ptr-1] : 0.0)
+#define RPLC(s,n) s[s##_ptr-1] = n
+#define CLS(s) s##_ptr = 0
+#define LEN(s) s##_ptr
+
+void setup() {
+  CLS(stack); // initialize stack
+  Serial.begin(38400); // Set serial baud rate, change later as needed.
+  delay(10);
+  Serial.write("PON\n");
+
+  LoadCell.begin();
+  //LoadCell.setReverseOutput(); //uncomment to turn a negative output value to positive
+  unsigned long stabilizingtime = 2000; // preciscion right after power-up can be improved by adding a few seconds of stabilizing time
+  boolean _tare = true; //set this to false if you don't want tare to be performed in the next step
+  LoadCell.start(stabilizingtime, _tare);
+  if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
+    ERROR("TO");
+    while (1);
+  }
+  else {
+    // Change this as needed
+    LoadCell.setCalFactor(CAL); // user set calibration value (float), initial value 1.0 may be used for this sketch
+    // Serial.println("STUPED");
+  }
+  while (!LoadCell.update()); // Wait for it startup
+  //start calibration procedure
+  // delay(2000); // wait for 2 secs
+  light.setup(); // do the color correction, take about 2 secs
+  LoadCell.tareNoDelay();
+  Serial.write("T\n");
+}
+void loop() {
+  bool upd = false;
+  color c = light.getColor(upd);
+  if (upd && (c != BLACK)) {
+      Serial.write("C");
+      Serial.write((char)('0'+c));
+      Serial.write("\n");
+      }
+  static boolean newDataReady = 0;
+  const int serialPrintInterval = 2; //increase value to slow down serial print activity
+  const float threshold = 170.0; // min weight of 1 bag
+  
+  // check for new data/start next conversion:
+  if (LoadCell.update()) newDataReady = true;
+
+  // get smoothed value from the dataset:
+  if (newDataReady) {
+    if (millis() > t + serialPrintInterval) {
+      float i = LoadCell.getData();
+      if ((i - PEEK(stack)) > 0.95*threshold) {
+        float old = PEEK(stack);
+        PUSH(stack,i);
+#if defined(BB_DEBUG)
+        Serial.print(i);
+        Serial.print(" INC ");
+        Serial.print(i-old);
+        Serial.print(" NUM ");
+#endif
+        Serial.write("L");
+        Serial.write((char)('0'+LEN(stack)));
+        Serial.write("\n");
+      } else
+      // if there are obviously no bags, it is a good opptunity to tare
+      if ((i < (0.5*threshold)) && (PEEK(stack) > (0.5*threshold))) {
+        delay(1000); // wait for 1 secs
+        LoadCell.tareNoDelay();
+        CLS(stack);
+        Serial.write("L0\n");
+      } else if ((LEN(stack)>1) &&
+                 (((PEEK(stack) - stack[stack_ptr-2]) < 0.3*threshold) ||
+                  (abs(i - stack[stack_ptr-2]) < 0.3*threshold))) {
+        POP(stack);
+        Serial.write("L");
+#if defined(BB_DEBUG)
+        Serial.print(PEEK(stack));
+        Serial.print(" NUM ");
+#endif
+        Serial.write((char)('0'+LEN(stack)));
+        Serial.write("\n");
+        }
+      else if ( abs(PEEK(stack)-i) < 0.01*threshold) {
+        //Serial.print("ADJ ");
+        //Serial.print(i);
+        RPLC(stack,i);
+      }
+
+      newDataReady = 0;
+      t = millis();
+    }
+  }
+
+  // check if last tare operation is complete
+  if (LoadCell.getTareStatus() == true) {
+    Serial.write("R\n"); // Ready
+  }
+}
+
+
